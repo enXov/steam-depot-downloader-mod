@@ -152,8 +152,7 @@ impl DepotManifest {
         self.filenames_encrypted = false;
         // Steam sorts after decryption with OrdinalIgnoreCase; lowercase-ordinal is the
         // closest portable approximation.
-        self.files
-            .sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        self.files.sort_by_key(|file| file.path.to_lowercase());
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 
 A Rust library for downloading Steam depot content using **user-supplied depot keys** and
 **manifest files** - a library-first port of
-[DepotDownloaderMod](https://github.com/enXov/DepotDownloaderMod) (itself a fork of
+[DepotDownloaderMod](https://github.com/SteamAutoCracks/DepotDownloaderMod) (itself a fork of
 [SteamRE's DepotDownloader](https://github.com/SteamRE/DepotDownloader)), built on
 [steam-protobuf-rs](https://crates.io/crates/steam-protobuf-rs).
 
