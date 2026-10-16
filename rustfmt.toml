@@ -1,0 +1,10 @@
+# Match the project's Rust edition.
+edition = "2024"
+
+max_width = 100
+
+# Default indent is 4 spaces (rustfmt only supports 4 - this is here for clarity).
+tab_spaces = 4
+
+# Use `\n` line endings consistently.
+newline_style = "Unix"
