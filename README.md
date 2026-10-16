@@ -1,5 +1,10 @@
 # steam-depot-downloader-mod
 
+[![docs.rs](https://img.shields.io/docsrs/steam-depot-downloader-mod)](https://docs.rs/steam-depot-downloader-mod)
+[![crates.io](https://img.shields.io/crates/v/steam-depot-downloader-mod)](https://crates.io/crates/steam-depot-downloader-mod)
+[![Downloads](https://img.shields.io/crates/d/steam-depot-downloader-mod)](https://crates.io/crates/steam-depot-downloader-mod)
+[![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
+
 A Rust library for downloading Steam depot content using **user-supplied depot keys** and
 **manifest files** - a library-first port of
 [DepotDownloaderMod](https://github.com/SteamAutoCracks/DepotDownloaderMod) (itself a fork of
@@ -8,7 +13,7 @@ A Rust library for downloading Steam depot content using **user-supplied depot k
 
 DepotDownloader projects ship as CLI apps. That is fine for a terminal, but embedding them in a
 GUI means shelling out to a process (and, for the `.dll` builds, installing a .NET runtime on
-the target machine). This crate is the alternative: the same workflow as the mod, as a **native
+the target machine, cross-platform problems bla bla). This crate is the alternative: the same workflow as the mod, as a **native
 Rust library** you call directly - no runtime, no subprocess, no console window.
 
 ## Install

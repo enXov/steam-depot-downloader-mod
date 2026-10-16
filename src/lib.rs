@@ -32,14 +32,11 @@
 //! Missing files (including config files wiped between versions) are simply downloaded -
 //! verification is per-chunk, so "missing" and "corrupt" are the same problem.
 //!
-//! ## What this crate deliberately does not do
+//! ## Scope
 //!
-//! It implements the *mod's* feature set: user-supplied depot keys + user-supplied manifest
-//! files + plain HTTPS chunk downloads. It does **not** log into Steam, does not connect to a
-//! CM server, does not resolve branches via PICS, does not ask Steam for depot keys, and does
-//! not fetch manifests that require a manifest request code. Manifests must be supplied as
-//! raw `.manifest` files (the CDN's zip wrapper is the caller's business), and keys are
-//! 64-character hex strings paired with each manifest.
+//! This is a port of the *mod's* feature set: user-supplied depot keys + user-supplied
+//! manifest files + plain HTTPS chunk downloads. See the crate's README on GitHub for the
+//! full list of what it deliberately does not do (no Steam login, no PICS, no request codes).
 //!
 //! ## Quick start
 //!
@@ -88,6 +85,12 @@ mod manifest;
 mod progress;
 mod state;
 mod util;
+
+// Compiles the README's Rust examples as doctests, keeping them honest without inlining the
+// README into the rendered API docs (the two stay separate on purpose).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 pub use cdn::CdnServer;
 pub use config::{DownloadRequest, DownloadRequestBuilder, ManifestSource};
