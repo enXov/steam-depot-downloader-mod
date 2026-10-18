@@ -1,6 +1,6 @@
 [package]
 name = "steam-depot-downloader-mod"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust library for downloading Steam depot content with user-supplied depot keys and manifest files - embeddable in GUIs, CLIs and services alike."
