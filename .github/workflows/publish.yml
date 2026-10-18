@@ -1,18 +1,27 @@
-# Publishes the crate to crates.io. Triggered manually from the Actions tab
-# (workflow_dispatch) - this crate is not released via GitHub tags.
+# Publishes the crate to crates.io on every push to main: the patch version is bumped
+# automatically, so every commit to main becomes a release. The version-bump commit is pushed
+# back to main (and skipped as a trigger), so the repository always reflects what is live.
 
 name: publish
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # push the version-bump commit back to main
 
 jobs:
   publish:
+    # Don't re-trigger on this workflow's own version-bump commits.
+    if: "!startsWith(github.event.head_commit.message, 'chore(release)')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       # Gate the release on the same checks run locally.
       - name: Format
@@ -23,6 +32,22 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+      - name: Bump patch version
+        run: |
+          CURRENT=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          NEW="${CURRENT%.*}.$((${CURRENT##*.} + 1))"
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" Cargo.toml
+          cargo update -w
+          echo "NEW_VERSION=$NEW" >> "$GITHUB_ENV"
+
+      - name: Commit the bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$NEW_VERSION"
+          git push
 
       - name: Publish
         run: cargo publish --token "${{ secrets.CRATES_IO_TOKEN }}"

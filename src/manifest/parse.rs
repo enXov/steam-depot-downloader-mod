@@ -21,9 +21,6 @@ pub(crate) struct RawSections {
 }
 
 /// Parse the bytes of a raw `.manifest` file.
-///
-/// Note: Steam CDNs serve manifests inside a single-file zip wrapper. Callers holding that
-/// form must unzip it first - this parser accepts the raw section stream only.
 pub(crate) fn parse(data: &[u8]) -> Result<RawSections> {
     let mut cursor = 0usize;
     let mut payload = None;

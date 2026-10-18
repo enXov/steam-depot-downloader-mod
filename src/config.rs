@@ -18,8 +18,8 @@ use crate::util;
 /// (standard Rust API practice): the library never clones your manifest behind your back, and
 /// if you need to keep a copy, cloning it in your own code makes that cost explicit. Paths
 /// stay `PathBuf`-typed - the safe, validated path representation Rust gives you. The
-/// manifest must be a **raw `.manifest` file** (the section-framed protobuf Steam serves
-/// inside its CDN zip wrapper); if you hold the zip-wrapped form, unzip it first.
+/// manifest must be a **raw `.manifest` file**.
+
 #[derive(Clone, Debug)]
 pub enum ManifestSource {
     /// Load the manifest from a file on disk.

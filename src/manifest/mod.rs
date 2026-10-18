@@ -1,9 +1,7 @@
 //! Steam depot manifest (the binary format fed by `-manifestfile`).
 //!
 //! The bytes are a little-endian sequence of `[u32 magic][u32 length][protobuf payload]`
-//! sections ending with an EOF magic - the format Steam stores in `depotcache` and serves
-//! (zip-wrapped) on CDNs. We accept the **raw section stream** only; callers holding the CDN
-//! zip wrapper must unzip it first.
+//! sections ending with an EOF magic.
 //!
 //! Manifests frequently ship with AES-encrypted file names - call
 //! [`DepotManifest::decrypt_filenames`] with the depot key to read the real paths.
@@ -88,8 +86,7 @@ impl ManifestChunk {
 /// # Errors during parsing
 ///
 /// `depot_id` and `manifest_gid` are required to be present in the manifest metadata - this is
-/// what makes explicit `-depot`/`-manifest` arguments unnecessary (and what they are
-/// cross-checked against if supplied anyway).
+/// what makes explicit `-depot`/`-manifest` arguments unnecessary
 #[derive(Clone, Debug)]
 pub struct DepotManifest {
     depot_id: u32,
@@ -103,9 +100,6 @@ pub struct DepotManifest {
 
 impl DepotManifest {
     /// Parse raw manifest bytes (the exact content of a `.manifest` file).
-    ///
-    /// Note: Steam CDNs serve manifests inside a single-file zip wrapper. Callers holding that
-    /// form must unzip it first - this parser accepts the raw section stream only.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let raw = parse::parse(bytes)?;
         Self::from_sections(raw)

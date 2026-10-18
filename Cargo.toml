@@ -3,7 +3,7 @@ name = "steam-depot-downloader-mod"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust library for downloading Steam depot content with user-supplied depot keys and manifest files (a port of DepotDownloaderMod) - embeddable in GUIs, CLIs and services alike."
+description = "Rust library for downloading Steam depot content with user-supplied depot keys and manifest files - embeddable in GUIs, CLIs and services alike."
 license = "GPL-2.0-only"
 repository = "https://github.com/enXov/steam-depot-downloader-mod"
 readme = "README.md"
@@ -38,14 +38,6 @@ tokio = { version = "1", features = ["macros"] }
 tempfile = "3"
 crc32fast = "1"
 wiremock = "0.6"
-
-# ── Release Optimizations ────────────────────────────────────────────────────
-
-[profile.release]
-lto = "fat"            # cross-crate LTO (slow link, fast runtime)
-codegen-units = 1      # single codegen unit - best optimization
-opt-level = 3          # optimize for speed
-strip = "symbols"      # strip debug symbols from final binary
 
 # ── Rust Lints ────────────────────────────────────────────────────────────────
 
