@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::cdn::CdnServer;
@@ -51,7 +52,7 @@ impl CdnClient {
         chunk_id_hex: &str,
         expected_compressed_len: u32,
         cancel: &CancellationToken,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let count = self.servers.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % count;
         let mut last_error: Option<Error> = None;
@@ -90,7 +91,7 @@ impl CdnClient {
         Err(last_error.unwrap_or(Error::NoCdnServers))
     }
 
-    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+    async fn get(&self, url: &str) -> Result<Bytes> {
         let response = self.http.get(url).send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -99,6 +100,8 @@ impl CdnClient {
                 url: url.to_owned(),
             });
         }
-        Ok(response.bytes().await?.to_vec())
+        // `Response::bytes` already hands back the body as one `Bytes`; converting it into a
+        // Vec would copy the whole chunk a second time on its way to the chunk pipeline.
+        Ok(response.bytes().await?)
     }
 }

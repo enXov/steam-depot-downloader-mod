@@ -20,6 +20,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util",
 tokio-util = "0.7"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# The chunk hand-off between reqwest and the decrypt/decompress step: `Bytes` lets a body
+# change hands without a second copy into an owned Vec.
+bytes = "1"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 ecb = "0.1"

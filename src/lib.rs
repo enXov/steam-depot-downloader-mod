@@ -81,6 +81,7 @@ mod cdn;
 mod config;
 mod download;
 mod error;
+mod fileio;
 mod manifest;
 mod progress;
 mod state;

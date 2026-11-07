@@ -1262,6 +1262,7 @@ dependencies = [
  "adler2",
  "aes",
  "base64 0.22.1",
+ "bytes",
  "cbc",
  "crc32fast",
  "ecb",

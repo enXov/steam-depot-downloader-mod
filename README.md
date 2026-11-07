@@ -77,6 +77,10 @@ entire download pipeline (including verify, update-reuse, failure isolation and 
 runs against a `wiremock` fake CDN. A real captured manifest (`tests/fixtures/`) guards the
 parser against real-world bytes.
 
+On top of that, `tests/live_download.rs` checks the crate against **Steam's real CDN** - the
+fresh download, the zero-byte re-verify, and the single-chunk repair - using the Spacewar
+fixture. It is `#[ignore]`d so CI stays hermetic.
+
 ## License
 
 GPL-2.0-only - this crate is a behavioral port of the GPL-2.0 DepotDownloader.

@@ -4,6 +4,16 @@
 //! concurrency semaphore → commit state. Files are planned/executed concurrently; network
 //! concurrency is bounded by [`DownloadRequest::max_downloads`].
 //!
+//! Where the work of a run actually goes, in the order that matters for a fast download:
+//!
+//! | stage                   | cost                        | treatment |
+//! |-------------------------|-----------------------------|-----------|
+//! | chunk fetch             | network-bound               | `max_downloads`-wide semaphore |
+//! | decrypt + decompress    | CPU, per chunk              | thread-local scratch buffers + a retained zstd `DCtx` |
+//! | chunk verify/write      | small                       | positional I/O through `Arc<File>` - no mutex |
+//! | file plan (verify run)  | disk + CPU                  | one `spawn_blocking` per file, one stat per file |
+//! | chunk reuse copy        | disk, can be many GB        | coalesced runs, a pool of blocking tasks |
+//!
 //! Reuse semantics (exactly what the crate docs promise):
 //!
 //! | situation                                       | behavior                                      |
@@ -16,13 +26,12 @@
 //!
 //! Files on disk that are not listed in the manifest are never touched and never deleted.
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -30,10 +39,20 @@ use crate::cdn::client::CdnClient;
 use crate::cdn::{CdnServer, chunk, directory};
 use crate::config::{DepotSpec, DownloadRequest, ManifestSource};
 use crate::error::{Error, Result};
+use crate::fileio;
 use crate::manifest::{DepotManifest, ManifestChunk, ManifestFile};
 use crate::progress::{DepotReport, DownloadReport, ProgressEvent};
 use crate::state::StateStore;
 use crate::util;
+
+/// Largest single `pread`/`pwrite` used when moving a reused chunk into staging.
+/// Bounded so the coalescing below keeps memory flat no matter how big a run is.
+const COPY_STRIDE: u64 = 4 * 1024 * 1024;
+
+/// How many blocking tasks may copy reused chunks into staging at once. Local disk is the
+/// bottleneck there, not the CDN, so this is independent of `max_downloads` and small: an
+/// update that reuses most of the old install moves real gigabytes through it.
+const COPY_PARALLELISM: usize = 4;
 
 pub(crate) struct DownloadEngine {
     http: reqwest::Client,
@@ -78,6 +97,8 @@ struct DepotCtx<'a> {
     depot_downloaded: Arc<AtomicU64>,
     depot_bytes_total: u64,
     downloads_sem: Arc<Semaphore>,
+    /// Caps concurrent chunk-reuse copies (see [`COPY_PARALLELISM`]).
+    copies_sem: Arc<Semaphore>,
 }
 
 /// How a file's bytes are sourced.
@@ -89,6 +110,11 @@ struct FilePlan {
     copies: Vec<CopyOp>,
     /// Bytes already known-good when the plan starts (drives per-file progress).
     reused_bytes: u64,
+    /// Bytes of `reused_bytes` that still have to be copied into staging. Excluded from the
+    /// progress seed so copied bytes are counted once, by the copy job that moves them.
+    copy_bytes: u64,
+    /// The file already existed on disk (drives the `FileVerifying` progress event).
+    existed: bool,
     /// Nothing to do at all (content is provably identical to the previous install).
     skip: bool,
     /// Rebuild through a staging file instead of patching in place.
@@ -103,9 +129,50 @@ struct CopyOp {
     source_offset: u64,
 }
 
+/// One contiguous byte range to move out of the existing install into staging.
+///
+/// Adjacent [`CopyOp`]s coalesce into one of these: a delta update whose old and new
+/// boundaries line up (exactly what an untouched region of a build produces) then becomes a
+/// single large `pread`/`pwrite` pair rather than one syscall pair per chunk.
+#[derive(Clone, Copy)]
+struct CopyRun {
+    source_offset: u64,
+    dest_offset: u64,
+    len: u64,
+}
+
+/// Turn copy ops into maximal contiguous runs (ops are chunk-ordered, i.e. ascending
+/// destination offsets, so this is a single linear pass).
+fn coalesce_copy_runs(ops: &[CopyOp]) -> Vec<CopyRun> {
+    let mut runs: Vec<CopyRun> = Vec::new();
+    for op in ops {
+        if op.chunk.len_uncompressed == 0 {
+            continue;
+        }
+        let op_len = u64::from(op.chunk.len_uncompressed);
+        let op_src = op.source_offset;
+        let op_dst = op.chunk.offset;
+        if let Some(last) = runs.last_mut()
+            && last.source_offset + last.len == op_src
+            && last.dest_offset + last.len == op_dst
+        {
+            last.len += op_len;
+        } else {
+            runs.push(CopyRun {
+                source_offset: op_src,
+                dest_offset: op_dst,
+                len: op_len,
+            });
+        }
+    }
+    runs
+}
+
 /// Everything one chunk download needs; handed to [`DownloadEngine::download_chunk`].
 struct ChunkJob {
-    file_handle: Arc<Mutex<Option<std::fs::File>>>,
+    /// Shared, never mutable: positional writes need no lock, so one open handle serves every
+    /// chunk of the file.
+    file_handle: Arc<std::fs::File>,
     done_bytes: Arc<AtomicU64>,
     display_path: PathBuf,
     file_size: u64,
@@ -311,9 +378,26 @@ impl DownloadEngine {
                 .map(|m| m.files().iter().map(|f| (f.path.as_str(), f)).collect())
                 .unwrap_or_default();
 
-            let files = manifest.into_files();
-            let content_files: Vec<&ManifestFile> = files
-                .iter()
+            // 4. Directory entries. Created from the full file list before any content file
+            // task starts, so a nested file never has to create its own parent directory.
+            for file in manifest.files() {
+                if !file.is_directory() {
+                    continue;
+                }
+                if let Some(rel) = util::safe_relative_path(&file.path) {
+                    let dir = self.request.output_dir.join(rel);
+                    tokio::fs::create_dir_all(&dir)
+                        .await
+                        .map_err(Error::io_path(&dir))?;
+                }
+            }
+
+            // Each content file is consumed by exactly one task, so its chunk list can be
+            // *moved* into the plan instead of cloned - a large depot's chunk metadata never
+            // gets duplicated just to cross a `spawn_blocking` boundary.
+            let content_files: Vec<ManifestFile> = manifest
+                .into_files()
+                .into_iter()
                 .filter(|f| !f.is_directory() && !f.is_symlink())
                 .collect();
             let files_total = content_files.len();
@@ -327,20 +411,8 @@ impl DownloadEngine {
             })
             .await;
 
-            // 4. Directory entries.
-            for file in &files {
-                if !file.is_directory() {
-                    continue;
-                }
-                if let Some(rel) = util::safe_relative_path(&file.path) {
-                    let dir = self.request.output_dir.join(rel);
-                    tokio::fs::create_dir_all(&dir)
-                        .await
-                        .map_err(Error::io_path(&dir))?;
-                }
-            }
-
             // 5. Files concurrently; network concurrency is capped by the semaphore.
+            let copy_parallelism = self.request.max_downloads.min(COPY_PARALLELISM);
             let ctx = DepotCtx {
                 client,
                 depot_id,
@@ -353,8 +425,12 @@ impl DownloadEngine {
                 depot_downloaded: Arc::new(AtomicU64::new(0)),
                 depot_bytes_total: bytes_total,
                 downloads_sem: Arc::new(Semaphore::new(self.request.max_downloads)),
+                copies_sem: Arc::new(Semaphore::new(copy_parallelism)),
             };
 
+            // Each file is consumed by exactly one task, so its chunk list can be *moved*
+            // into the plan instead of cloned - a large depot's chunk metadata is never
+            // duplicated just to cross a `spawn_blocking` boundary.
             let mut tasks = FuturesUnordered::new();
             for file in content_files {
                 tasks.push(self.execute_file(&ctx, file));
@@ -395,7 +471,7 @@ impl DownloadEngine {
     }
 
     /// Plan + execute one content file of a depot.
-    async fn execute_file(&self, ctx: &DepotCtx<'_>, file: &ManifestFile) -> Result<()> {
+    async fn execute_file(&self, ctx: &DepotCtx<'_>, mut file: ManifestFile) -> Result<()> {
         let rel = util::safe_relative_path(&file.path).ok_or_else(|| {
             Error::Manifest(format!(
                 "unsafe or empty file path '{}' in manifest",
@@ -405,7 +481,31 @@ impl DownloadEngine {
         let final_path = self.request.output_dir.join(&rel);
         let display_path = rel.clone();
 
-        if std::fs::metadata(&final_path).is_ok() {
+        // Look the previous version of this exact file up once; it feeds both the
+        // skip decisions and the chunk-reuse plan.
+        let old_entry = ctx.old_by_path.get(file.path.as_str()).copied();
+        let old_entry_matches = !ctx.same_manifest
+            && old_entry.is_some_and(|e| {
+                e.size == file.size && e.sha_content.is_some() && e.sha_content == file.sha_content
+            });
+
+        // Plan (blocking: one stat of the target, then positional reads for chunk
+        // verification). The file's own chunks are moved in, not cloned.
+        let plan = {
+            let plan_input = PlanInput {
+                final_path: final_path.clone(),
+                size: file.size,
+                chunks: std::mem::take(&mut file.chunks),
+                old_chunks: old_entry.map(|e| e.chunks.clone()),
+                old_entry_matches,
+                verify_all: ctx.same_manifest,
+            };
+            tokio::task::spawn_blocking(move || plan_file(plan_input))
+                .await
+                .map_err(|e| Error::TaskFailed(e.to_string()))??
+        };
+
+        if plan.existed {
             self.emit(ProgressEvent::FileVerifying {
                 depot_id: ctx.depot_id,
                 path: display_path.clone(),
@@ -419,29 +519,6 @@ impl DownloadEngine {
             size: file.size,
         })
         .await;
-
-        // Plan (blocking: reads on-disk bytes for chunk verification).
-        let plan = {
-            let plan_input = PlanInput {
-                final_path: final_path.clone(),
-                size: file.size,
-                chunks: file.chunks.clone(),
-                old_chunks: ctx
-                    .old_by_path
-                    .get(file.path.as_str())
-                    .map(|e| e.chunks.clone()),
-                old_entry_matches: !ctx.same_manifest
-                    && ctx.old_by_path.get(file.path.as_str()).is_some_and(|e| {
-                        e.size == file.size
-                            && e.sha_content.is_some()
-                            && e.sha_content == file.sha_content
-                    }),
-                verify_all: ctx.same_manifest,
-            };
-            tokio::task::spawn_blocking(move || plan_file(plan_input))
-                .await
-                .map_err(|e| Error::TaskFailed(e.to_string()))??
-        };
 
         if plan.skip {
             let prev = ctx
@@ -468,7 +545,7 @@ impl DownloadEngine {
         };
 
         // Prepare the write target (blocking).
-        let file_handle: Arc<Mutex<Option<std::fs::File>>> = {
+        let file_handle: Arc<std::fs::File> = {
             let write_path = write_path.clone();
             let fresh = plan.staging || plan.fresh;
             let size = file.size;
@@ -494,34 +571,58 @@ impl DownloadEngine {
             })
             .await
             .map_err(|e| Error::TaskFailed(e.to_string()))??;
-            Arc::new(Mutex::new(Some(opened)))
+            Arc::new(opened)
         };
 
-        let done_bytes = Arc::new(AtomicU64::new(plan.reused_bytes));
+        // Bytes that will be *copied* count as "in place" once the copy has run, so the
+        // progress seed deliberately excludes them (the copy jobs below add their run length
+        // as they finish). Only chunks verified on disk in place - which are never moved -
+        // start out complete.
+        let done_bytes = Arc::new(AtomicU64::new(plan.reused_bytes - plan.copy_bytes));
 
-        // Copy reused chunks into staging (sequential local IO).
-        if !plan.copies.is_empty() {
-            let copies = plan.copies.clone();
+        // Copy reused chunks into staging (parallel, coalesced local IO).
+        let runs = coalesce_copy_runs(&plan.copies);
+        if !runs.is_empty() {
             let source_path = final_path.clone();
             let handle = Arc::clone(&file_handle);
-            let done = Arc::clone(&done_bytes);
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let source =
-                    std::fs::File::open(&source_path).map_err(Error::io_path(&source_path))?;
-                for op in copies {
-                    let mut buf = vec![0u8; op.chunk.len_uncompressed as usize];
-                    read_at(&source, &mut buf, op.source_offset).map_err(Error::Io)?;
-                    {
-                        let mut guard = handle.lock().expect("file handle mutex");
-                        let f = guard.as_mut().expect("file handle open");
-                        write_at(f, &buf, op.chunk.offset).map_err(Error::Io)?;
-                    }
-                    done.fetch_add(u64::from(op.chunk.len_uncompressed), Ordering::Relaxed);
+            let staged_done = Arc::clone(&done_bytes);
+            let depot_cancel = ctx.depot_cancel.clone();
+            let mut copy_jobs = FuturesUnordered::new();
+            for run in runs {
+                if depot_cancel.is_cancelled() || self.cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
                 }
-                Ok(())
-            })
-            .await
-            .map_err(|e| Error::TaskFailed(e.to_string()))??;
+                let permit = Arc::clone(&ctx.copies_sem)
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| Error::TaskFailed(e.to_string()))?;
+                let source_path = source_path.clone();
+                let handle = Arc::clone(&handle);
+                let done = Arc::clone(&staged_done);
+                copy_jobs.push(tokio::task::spawn_blocking(move || -> Result<()> {
+                    let _permit = permit;
+                    let source =
+                        std::fs::File::open(&source_path).map_err(Error::io_path(&source_path))?;
+                    // One buffer per run, reused across its strided reads/writes.
+                    let mut buf = vec![0u8; run.len.min(COPY_STRIDE) as usize];
+                    let mut remaining = run.len;
+                    let mut src = run.source_offset;
+                    let mut dst = run.dest_offset;
+                    while remaining > 0 {
+                        let stride = remaining.min(buf.len() as u64) as usize;
+                        fileio::read_at(&source, &mut buf[..stride], src).map_err(Error::Io)?;
+                        fileio::write_at(&handle, &buf[..stride], dst).map_err(Error::Io)?;
+                        src += stride as u64;
+                        dst += stride as u64;
+                        remaining -= stride as u64;
+                    }
+                    done.fetch_add(run.len, Ordering::Relaxed);
+                    Ok(())
+                }));
+            }
+            while let Some(result) = copy_jobs.next().await {
+                result.map_err(|e| Error::TaskFailed(e.to_string()))??;
+            }
         }
 
         // Download the remaining chunks.
@@ -550,25 +651,37 @@ impl DownloadEngine {
             result?;
         }
 
+        if plan.staging {
+            // About to swap the staging file over the real one: a cancellation that lands
+            // after even a single chunk of the new content is missing must leave the old file
+            // alone, never promote a half-written staging file.
+            if ctx.depot_cancel.is_cancelled() || self.cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+        }
+
         // Finalize (blocking): correct the length, swap staging over the final path,
         // apply executable bits.
         {
             let write_path = write_path.clone();
-            let handle = Arc::clone(&file_handle);
             let is_staging = plan.staging;
             let size = file.size;
             let exec = file.is_executable();
+            let final_path = final_path.clone();
+            // Every chunk and copy future has settled and dropped its share, so this task
+            // holds the only reference left. Moving it (instead of cloning again) is what
+            // makes the handle below close before the rename - and renaming over a handle
+            // that is still open is not portable.
+            let handle = file_handle;
+            debug_assert_eq!(Arc::strong_count(&handle), 1);
             tokio::task::spawn_blocking(move || -> Result<()> {
                 {
-                    let mut guard = handle.lock().expect("file handle mutex");
-                    if let Some(f) = guard.as_mut() {
-                        let meta = f.metadata().map_err(Error::Io)?;
-                        if meta.len() != size {
-                            f.set_len(size).map_err(Error::Io)?;
-                        }
+                    let meta = handle.metadata().map_err(Error::Io)?;
+                    if meta.len() != size {
+                        handle.set_len(size).map_err(Error::Io)?;
                     }
-                    *guard = None; // close before the rename
                 }
+                drop(handle); // close before the rename
                 if is_staging {
                     if final_path.exists() {
                         std::fs::remove_file(&final_path).map_err(Error::io_path(&final_path))?;
@@ -637,22 +750,22 @@ impl DownloadEngine {
         };
         let network_len = raw.len() as u64;
 
-        // Decrypt + verify + write (blocking).
+        // Decrypt + verify + write at the chunk's offset (blocking). The body is moved into
+        // the blocking task and handed to the chunk pipeline as a slice: no second copy of
+        // the chunk, and the pipeline reuses this thread's scratch buffers.
         let key = ctx.key;
         let offset = chunk.offset;
         let handle = Arc::clone(&file_handle);
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let data = chunk::process_chunk(
+            chunk::process_chunk_at(
                 &raw,
                 &key,
                 chunk.len_uncompressed,
                 chunk.adler32,
                 &chunk_hex,
-            )?;
-            let mut guard = handle.lock().expect("file handle mutex");
-            let f = guard.as_mut().expect("file handle open");
-            write_at(f, &data, offset).map_err(Error::Io)?;
-            Ok(())
+                &handle,
+                offset,
+            )
         })
         .await
         .map_err(|e| Error::TaskFailed(e.to_string()))??;
@@ -696,6 +809,7 @@ impl DownloadEngine {
 struct PlanInput {
     final_path: PathBuf,
     size: u64,
+    /// Moved in from the file entry; the plan hands the survivors on to the downloader.
     chunks: Vec<ManifestChunk>,
     old_chunks: Option<Vec<ManifestChunk>>,
     old_entry_matches: bool,
@@ -704,7 +818,9 @@ struct PlanInput {
 
 /// Decide, for one file, which chunks can be reused from disk and which must be downloaded.
 ///
-/// Pure filesystem work - runs inside `spawn_blocking`.
+/// Pure filesystem work - runs inside `spawn_blocking`. It also reports whether the target
+/// existed, which is the single stat the caller needs to decide between `FileVerifying` and a
+/// plain start (planning used to be handed to a second stat of the same file).
 fn plan_file(input: PlanInput) -> Result<FilePlan> {
     let PlanInput {
         final_path,
@@ -719,15 +835,20 @@ fn plan_file(input: PlanInput) -> Result<FilePlan> {
         .ok()
         .filter(|m| m.is_file())
         .map(|m| m.len());
+    let existed = existing_len.is_some();
 
     // Empty content file: only the length differs from "nothing".
     if size == 0 || chunks.is_empty() {
         return Ok(match existing_len {
             Some(0) => FilePlan {
+                existed,
                 skip: true,
                 ..FilePlan::default()
             },
-            Some(_) => FilePlan::default(), // exists, wrong size → finalize truncates
+            Some(_) => FilePlan {
+                existed,
+                ..FilePlan::default()
+            }, // exists, wrong size → finalize truncates
             None => FilePlan {
                 fresh: true,
                 ..FilePlan::default()
@@ -737,6 +858,7 @@ fn plan_file(input: PlanInput) -> Result<FilePlan> {
 
     let Some(existing_len) = existing_len else {
         return Ok(FilePlan {
+            existed,
             downloads: chunks,
             fresh: true,
             ..FilePlan::default()
@@ -747,6 +869,7 @@ fn plan_file(input: PlanInput) -> Result<FilePlan> {
     // on-disk length agrees → skip without reading a single byte.
     if old_entry_matches && existing_len == size {
         return Ok(FilePlan {
+            existed,
             skip: true,
             ..FilePlan::default()
         });
@@ -758,13 +881,20 @@ fn plan_file(input: PlanInput) -> Result<FilePlan> {
     if !verify_all {
         if let Some(old_chunks) = &old_chunks {
             if !old_chunks.is_empty() {
-                return plan_reuse_from_old(&final_path, size, chunks, old_chunks, existing_len);
+                return plan_reuse_from_old(&final_path, size, chunks, old_chunks, existing_len)
+                    .map(|mut plan| {
+                        plan.existed = existed;
+                        plan
+                    });
             }
         }
     }
 
     // Steam-style verification: read every chunk position and check it against the manifest.
-    plan_verify_in_place(&final_path, chunks, existing_len)
+    plan_verify_in_place(&final_path, chunks, existing_len).map(|mut plan| {
+        plan.existed = existed;
+        plan
+    })
 }
 
 fn plan_reuse_from_old(
@@ -792,6 +922,9 @@ fn plan_reuse_from_old(
         });
     };
 
+    // One read buffer, reused for every chunk of this file: a file's chunks are the same size
+    // in practice, so this is a single allocation instead of one per chunk.
+    let mut buf: Vec<u8> = Vec::new();
     for old_chunk in old_chunks {
         let Some(indices) = new_by_id.get(&old_chunk.id) else {
             continue;
@@ -804,8 +937,9 @@ fn plan_reuse_from_old(
         {
             continue;
         }
-        let mut buf = vec![0u8; old_chunk.len_uncompressed as usize];
-        if read_at(&source, &mut buf, old_chunk.offset).is_err() {
+        buf.clear();
+        buf.resize(old_chunk.len_uncompressed as usize, 0);
+        if fileio::read_at(&source, &mut buf, old_chunk.offset).is_err() {
             continue;
         }
         if util::adler32_seed0(&buf) != old_chunk.adler32 {
@@ -825,13 +959,20 @@ fn plan_reuse_from_old(
         new_by_id.insert(old_chunk.id, Vec::new());
     }
 
-    let downloads: Vec<ManifestChunk> = chunks
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !covered[*index])
-        .map(|(_, chunk)| chunk.clone())
-        .collect();
-    let reused_bytes = copies
+    // Uncovered chunks are the download set; move the covered ones to the end in place so the
+    // vector the plan returns is the same allocation `chunks` arrived in.
+    let mut downloads = chunks;
+    let mut write = 0usize;
+    #[allow(clippy::needless_range_loop)]
+    for read in 0..downloads.len() {
+        if !covered[read] {
+            downloads.swap(write, read);
+            write += 1;
+        }
+    }
+    downloads.truncate(write);
+
+    let copy_bytes = copies
         .iter()
         .map(|op| u64::from(op.chunk.len_uncompressed))
         .sum();
@@ -839,7 +980,8 @@ fn plan_reuse_from_old(
     Ok(FilePlan {
         downloads,
         copies,
-        reused_bytes,
+        reused_bytes: copy_bytes,
+        copy_bytes,
         staging: true,
         ..FilePlan::default()
     })
@@ -850,30 +992,39 @@ fn plan_verify_in_place(
     chunks: Vec<ManifestChunk>,
     existing_len: u64,
 ) -> Result<FilePlan> {
-    let mut downloads = Vec::new();
+    let mut chunks = chunks;
     let mut reused_bytes = 0u64;
 
     let source = std::fs::File::open(final_path).ok();
-    for chunk in chunks {
+    // One read buffer for the whole file's verification pass.
+    let mut buf: Vec<u8> = Vec::new();
+    // Bad chunks are moved to the end in place, so the plan reuses the vector it was given.
+    let mut write = 0usize;
+    #[allow(clippy::needless_range_loop)]
+    for read in 0..chunks.len() {
         let readable =
-            source.is_some() && chunk.offset + u64::from(chunk.len_uncompressed) <= existing_len;
+            chunks[read].offset + u64::from(chunks[read].len_uncompressed) <= existing_len;
         let ok = if let (Some(source), true) = (&source, readable) {
-            let mut buf = vec![0u8; chunk.len_uncompressed as usize];
-            read_at(source, &mut buf, chunk.offset).is_ok()
-                && util::adler32_seed0(&buf) == chunk.adler32
+            buf.clear();
+            buf.resize(chunks[read].len_uncompressed as usize, 0);
+            fileio::read_at(source, &mut buf, chunks[read].offset).is_ok()
+                && util::adler32_seed0(&buf) == chunks[read].adler32
         } else {
             false
         };
         if ok {
-            reused_bytes += u64::from(chunk.len_uncompressed);
+            reused_bytes += u64::from(chunks[read].len_uncompressed);
         } else {
-            downloads.push(chunk);
+            chunks.swap(write, read);
+            write += 1;
         }
     }
+    chunks.truncate(write);
 
     Ok(FilePlan {
-        downloads,
+        downloads: chunks,
         reused_bytes,
+        copy_bytes: 0,
         ..FilePlan::default()
     })
 }
@@ -884,54 +1035,6 @@ fn staging_name(rel: &Path) -> PathBuf {
         "{}.tmp",
         util::to_hex_lower(&util::sha1(rel.to_string_lossy().as_bytes()))
     ))
-}
-
-/// Positional read, mirroring SteamKit's `FileStream.Seek + Read` usage.
-#[cfg(unix)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut read = 0usize;
-    while read < buf.len() {
-        let n = file.seek_read(&mut buf[read..], offset + read as u64)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short read",
-            ));
-        }
-        read += n;
-    }
-    Ok(())
-}
-
-/// Positional write, mirroring SteamKit's `FileStream.Seek + Write` usage.
-#[cfg(unix)]
-fn write_at(file: &mut std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn write_at(file: &mut std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        let n = file.seek_write(&buf[written..], offset + written as u64)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short write",
-            ));
-        }
-        written += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1236,6 +1339,107 @@ mod tests {
 
         let state = StateStore::load(out.path());
         assert_eq!(state.installed_gid(DEPOT_ID), Some(2001));
+    }
+
+    /// Progress accounting for the staged-reuse path: the seeds (`FileStarted`, plus the bytes
+    /// reported complete by every `ChunkCompleted`) must describe the file's real content and
+    /// never exceed it, i.e. copied bytes are counted exactly once.
+    #[tokio::test]
+    async fn staged_reuse_reports_progress_within_file_size() {
+        let server = MockServer::start().await;
+        // A single chunk at the front: an update that keeps it forces a whole-file rebuild,
+        // so every copied byte goes through staging.
+        let v1_content: Vec<u8> = (0..2 * CHUNK_SIZE).map(|i| (i % 137) as u8).collect();
+        let v1 = build_manifest(DEPOT_ID, 2100, &[("bin/game.exe", v1_content.clone(), 32)]);
+        mount_chunks(&server, DEPOT_ID, &chunks_with_offsets(&v1_content)).await;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let report = run_download(
+            out.path(),
+            v1,
+            &test_key_hex(),
+            server.address().to_string(),
+        )
+        .await;
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+
+        // v2: same first chunk (reusable), a new second chunk.
+        let mut v2_content = v1_content.clone();
+        v2_content.extend((0..CHUNK_SIZE).map(|i| (i % 41) as u8));
+        let v2 = build_manifest(DEPOT_ID, 2101, &[("bin/game.exe", v2_content.clone(), 32)]);
+
+        let server2 = MockServer::start().await;
+        let new_chunks = chunks_with_offsets(&v2_content);
+        let (_, new_body) = new_chunks.last().expect("new chunk").clone();
+        mount_chunks(
+            &server2,
+            DEPOT_ID,
+            &[(new_chunks.last().expect("c").0.clone(), new_body)],
+        )
+        .await;
+
+        let events = {
+            let downloader = crate::DepotDownloader::builder()
+                .cdn_servers(vec![
+                    CdnServer::http(server2.address().to_string().as_str()).expect("address"),
+                ])
+                .build()
+                .expect("downloader");
+            let request = DownloadRequest::builder()
+                .app_id(APP_ID)
+                .depots([(v2, test_key_hex())])
+                .output_dir(out.path())
+                .build()
+                .expect("request");
+            let mut handle = downloader.download(request);
+            let mut seen = Vec::new();
+            while let Some(event) = handle.events().recv().await {
+                let stop = matches!(event, ProgressEvent::Finished { .. });
+                seen.push(event);
+                if stop {
+                    break;
+                }
+            }
+            handle.join().await.expect("join");
+            seen
+        };
+
+        let started_size = events
+            .iter()
+            .find_map(|e| match e {
+                ProgressEvent::FileStarted { size, .. } => Some(*size),
+                _ => None,
+            })
+            .expect("FileStarted");
+        assert_eq!(started_size, v2_content.len() as u64);
+
+        // Every chunk's cumulative completion stays inside the file, and the reused first
+        // chunk is not reported twice over.
+        let mut max_completed = 0u64;
+        let mut chunk_events = 0usize;
+        for event in &events {
+            if let ProgressEvent::ChunkCompleted {
+                file_bytes_completed,
+                ..
+            } = event
+            {
+                chunk_events += 1;
+                assert!(
+                    *file_bytes_completed <= started_size,
+                    "progress {} exceeds file size {}",
+                    file_bytes_completed,
+                    started_size
+                );
+                max_completed = max_completed.max(*file_bytes_completed);
+            }
+        }
+        assert_eq!(chunk_events, 1, "only the new chunk is downloaded");
+        // 128 KiB seen in place (the reusable first chunk) + 128 KiB just downloaded.
+        assert_eq!(max_completed, v2_content.len() as u64);
+        assert_eq!(
+            std::fs::read(out.path().join("bin/game.exe")).expect("game.exe"),
+            v2_content
+        );
     }
 
     #[tokio::test]
