@@ -2,7 +2,7 @@
 //!
 //! Wire format per name: base64 of `AES256-ECB(key, iv) ++ AES256-CBC(key, iv, name\0, PKCS7)`.
 
-use aes::cipher::{BlockDecrypt, BlockDecryptMut, KeyInit, KeyIvInit};
+use aes::cipher::{BlockDecrypt, BlockDecryptMut, InnerIvInit, KeyInit};
 use base64::Engine;
 use cbc::cipher::block_padding::Pkcs7;
 
@@ -10,17 +10,20 @@ use crate::error::{Error, Result};
 use crate::manifest::ManifestFile;
 
 pub(super) fn decrypt_names(files: &mut [ManifestFile], key: &[u8; 32]) -> Result<()> {
+    // One AES-256 key schedule for the whole manifest, shared by the IV (ECB) and body (CBC)
+    // decryption of every name, instead of two expansions per name.
+    let cipher = aes::Aes256::new_from_slice(key).expect("key length is enforced by type");
     for file in files.iter_mut() {
-        file.path = decrypt_one(key, &file.path)?;
+        file.path = decrypt_one(&cipher, &file.path)?;
 
         if let Some(target) = file.link_target.take() {
-            file.link_target = Some(decrypt_one(key, &target)?);
+            file.link_target = Some(decrypt_one(&cipher, &target)?);
         }
     }
     Ok(())
 }
 
-fn decrypt_one(key: &[u8; 32], encoded: &str) -> Result<String> {
+fn decrypt_one(cipher: &aes::Aes256, encoded: &str) -> Result<String> {
     // .NET's base64 converter (what Steam uses) silently ignores embedded whitespace -
     // Steam wraps long encrypted names across lines. Mirror that before decoding.
     let cleaned: String = encoded
@@ -40,13 +43,11 @@ fn decrypt_one(key: &[u8; 32], encoded: &str) -> Result<String> {
     }
 
     // First block: the CBC IV, itself AES-ECB-encrypted.
-    let cipher = aes::Aes256::new_from_slice(key).expect("key length is enforced by type");
     let mut iv: [u8; 16] = blob[..16].try_into().expect("16-byte slice");
     cipher.decrypt_block((&mut iv).into());
 
     // Remainder: AES-256-CBC with PKCS7 padding.
-    let mut plaintext = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, &iv)
-        .expect("key/iv sizes")
+    let mut plaintext = cbc::Decryptor::<aes::Aes256>::inner_iv_init(cipher.clone(), &iv.into())
         .decrypt_padded_vec_mut::<Pkcs7>(&blob[16..])
         .map_err(|e| Error::ManifestNameDecrypt(format!("CBC/PKCS7 decrypt failed: {e}")))?;
 
@@ -73,7 +74,8 @@ mod tests {
     fn roundtrips_pair() {
         let name = "common/media/logo.png";
         let encrypted = encrypt_fixture_name_passthrough(name);
-        let decrypted = decrypt_one(&TEST_DEPOT_KEY, &encrypted).expect("decrypts");
+        let cipher = aes::Aes256::new_from_slice(&TEST_DEPOT_KEY).expect("key");
+        let decrypted = decrypt_one(&cipher, &encrypted).expect("decrypts");
         assert_eq!(decrypted, name);
     }
 

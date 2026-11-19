@@ -53,6 +53,7 @@ pub struct ManifestFile {
     pub sha_content: Option<[u8; 20]>,
     /// Symlink target, if this is a symlink entry.
     pub link_target: Option<String>,
+    /// The file's chunks, sorted by ascending [`ManifestChunk::offset`].
     pub chunks: Vec<ManifestChunk>,
 }
 
@@ -225,6 +226,11 @@ impl DepotManifest {
                     len_compressed: chunk.cb_compressed.unwrap_or(0),
                 });
             }
+            // Steam stores a file's chunks in an arbitrary order (in practice usually by chunk
+            // id), not by offset - e.g. 314 of the 346 multi-chunk files of the Aion 2 fixture
+            // are out of order. Everything downstream (verification reads, reuse-copy
+            // coalescing, write order) wants ascending offsets for sequential disk I/O.
+            chunks.sort_unstable_by_key(|chunk| chunk.offset);
 
             let sha_content = match mapping.sha_content {
                 Some(bytes) => Some(bytes.as_slice().try_into().map_err(|_| {
@@ -319,6 +325,14 @@ mod tests {
         assert_eq!(manifest.manifest_gid(), 9_124_639_090_373_514_581);
         assert!(manifest.filenames_encrypted());
         assert_eq!(manifest.files().len(), 1375);
+        // Steam stores most of this manifest's chunk lists out of offset order; parsing must
+        // hand them out sorted.
+        assert!(
+            manifest
+                .files()
+                .iter()
+                .all(|f| f.chunks.windows(2).all(|w| w[0].offset < w[1].offset))
+        );
         // Encrypted names are base64 - only the base64 alphabet plus the line-wrapping
         // whitespace Steam embeds (`/` IS part of the base64 alphabet).
         assert!(

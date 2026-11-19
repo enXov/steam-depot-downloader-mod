@@ -13,7 +13,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::io::{BufReader, Cursor, Read};
+use std::io::{Cursor, Read};
 
 use aes::cipher::{BlockDecrypt, BlockDecryptMut, KeyInit, KeyIvInit};
 use cbc::cipher::block_padding::Pkcs7;
@@ -58,6 +58,38 @@ thread_local! {
     static CHUNK_SCRATCH: RefCell<ChunkScratch> = RefCell::new(ChunkScratch::new());
 }
 
+/// Why a downloaded chunk could not be turned into file content, classified for the CDN retry
+/// loop ([`super::client::CdnClient::fetch_chunk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkFailureKind {
+    /// The body decrypted but its content is bad (container framing, decompression, size,
+    /// Adler-32): a corrupt server response - another server may well have a good copy.
+    Corrupt,
+    /// AES-CBC/PKCS7 decryption failed. Almost always a wrong depot key - which no server can
+    /// fix - but a corrupted last block looks the same, so the retry loop allows exactly one
+    /// more server before giving up.
+    Decrypt,
+    /// Local failure (writing the chunk to disk): never a server's fault.
+    Local,
+}
+
+/// A chunk processing error plus its retry classification.
+#[derive(Debug)]
+pub(crate) struct ChunkFailure {
+    pub(crate) kind: ChunkFailureKind,
+    pub(crate) error: Error,
+}
+
+impl From<Error> for ChunkFailure {
+    /// Content errors (the default inside [`process_into`]) are server-side corruption.
+    fn from(error: Error) -> Self {
+        ChunkFailure {
+            kind: ChunkFailureKind::Corrupt,
+            error,
+        }
+    }
+}
+
 /// Convenience wrapper that returns the decompressed chunk instead of writing it to a file.
 ///
 /// Convenient for round-trip fixtures (and for callers that want the chunk in memory); the
@@ -79,18 +111,20 @@ pub(crate) fn process_chunk(
             expected_len,
             expected_adler32,
             chunk_id_hex,
-        )?;
+        )
+        .map_err(|failure| failure.error)?;
         // The scratch buffer is sized exactly right from the container, so this is the last
         // allocation its capacity ever pays for.
         Ok(scratch.out.clone())
     })
 }
 
-/// Process a chunk and write it straight to its final offset in `file`.
+/// Process a chunk and write it straight to its final offset(s) in `file`.
 ///
 /// This is the engine's hot path: compared to [`process_chunk`], it skips the copy of the
 /// decompressed output out of the scratch buffer, so a chunk is decrypted, decompressed and
-/// written with no allocation beyond its network body.
+/// written with no allocation beyond its network body. A chunk that occurs several times in
+/// the same file is processed once and written to every offset in `offsets`.
 pub(crate) fn process_chunk_at(
     raw: &[u8],
     depot_key: &[u8; 32],
@@ -98,8 +132,8 @@ pub(crate) fn process_chunk_at(
     expected_adler32: u32,
     chunk_id_hex: &str,
     file: &std::fs::File,
-    offset: u64,
-) -> Result<()> {
+    offsets: &[u64],
+) -> std::result::Result<(), ChunkFailure> {
     CHUNK_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         process_into(
@@ -110,7 +144,13 @@ pub(crate) fn process_chunk_at(
             expected_adler32,
             chunk_id_hex,
         )?;
-        crate::fileio::write_at(file, &scratch.out, offset).map_err(Error::Io)
+        for &offset in offsets {
+            crate::fileio::write_at(file, &scratch.out, offset).map_err(|e| ChunkFailure {
+                kind: ChunkFailureKind::Local,
+                error: Error::Io(e),
+            })?;
+        }
+        Ok(())
     })
 }
 
@@ -123,7 +163,7 @@ fn process_into(
     expected_len: u32,
     expected_adler32: u32,
     chunk_id_hex: &str,
-) -> Result<()> {
+) -> std::result::Result<(), ChunkFailure> {
     let chunk_err = |reason: String| Error::Chunk {
         chunk_id: chunk_id_hex.to_owned(),
         reason,
@@ -133,7 +173,8 @@ fn process_into(
         return Err(chunk_err(format!(
             "downloaded {} bytes; not a valid encrypted chunk",
             raw.len()
-        )));
+        ))
+        .into());
     }
 
     // 1. Decrypt: first 16 bytes are the ECB-encrypted IV, remainder is CBC/PKCS7.
@@ -149,7 +190,10 @@ fn process_into(
     let decrypted_len = cbc::Decryptor::<aes::Aes256>::new_from_slices(depot_key, &iv)
         .expect("key/iv sizes")
         .decrypt_padded_mut::<Pkcs7>(plain)
-        .map_err(|_| chunk_err("CBC decrypt failed (wrong depot key?)".to_owned()))?
+        .map_err(|_| ChunkFailure {
+            kind: ChunkFailureKind::Decrypt,
+            error: chunk_err("CBC decrypt failed (wrong depot key?)".to_owned()),
+        })?
         .len();
     let decrypted = &plain[..decrypted_len];
 
@@ -161,16 +205,22 @@ fn process_into(
         decompress_vzip(decrypted, out, &chunk_err)?
     } else if decrypted.starts_with(b"PK\x03\x04") {
         decompress_zip(decrypted, out, &chunk_err)?
-    } else if decrypted.len() >= 4 {
-        return Err(chunk_err(format!(
-            "unexpected compression magic 0x{}",
-            util::to_hex_lower(&decrypted[..4])
-        )));
     } else {
-        return Err(chunk_err(format!(
-            "only {} bytes after decrypt",
-            decrypted.len()
-        )));
+        // No known container: the plaintext is garbage. With a wrong key, PKCS7 padding
+        // happens to validate about 1 time in 256 and lands here - so classify it like a
+        // decrypt failure, not as plain server corruption.
+        let reason = if decrypted.len() >= 4 {
+            format!(
+                "unexpected compression magic 0x{} (wrong depot key?)",
+                util::to_hex_lower(&decrypted[..4])
+            )
+        } else {
+            format!("only {} bytes after decrypt", decrypted.len())
+        };
+        return Err(ChunkFailure {
+            kind: ChunkFailureKind::Decrypt,
+            error: chunk_err(reason),
+        });
     }
 
     // 3. Verify against the manifest's expectations.
@@ -178,7 +228,8 @@ fn process_into(
         return Err(chunk_err(format!(
             "decompressed to {} bytes, expected {expected_len}",
             out.len()
-        )));
+        ))
+        .into());
     }
     let actual = crate::util::adler32_seed0(out);
     if actual != expected_adler32 {
@@ -186,7 +237,8 @@ fn process_into(
             chunk_id: chunk_id_hex.to_owned(),
             expected: expected_adler32,
             actual,
-        });
+        }
+        .into());
     }
     Ok(())
 }
@@ -271,8 +323,12 @@ fn decompress_vzip(data: &[u8], out: &mut Vec<u8>, err: &dyn Fn(String) -> Error
         LzmaDecoder::new(params, None).map_err(|e| err(format!("lzma init failed: {e}")))?;
 
     // Appends from offset 0 through `Write`, so the retained capacity is reused for free.
+    // `&[u8]` is already a `BufRead`; wrapping it in a `BufReader` would only add a copy.
     out.clear();
-    let mut input = BufReader::new(lzma_payload);
+    // Reserve the declared size up front (capped: the footer is not yet verified, and real
+    // chunks are ~1 MiB) so the decoder does not grow the buffer by doubling.
+    out.reserve((size_decompressed as usize).min(16 * 1024 * 1024));
+    let mut input = lzma_payload;
     decoder
         .decompress(&mut input, out)
         .map_err(|e| err(format!("lzma decompress failed: {e}")))?;

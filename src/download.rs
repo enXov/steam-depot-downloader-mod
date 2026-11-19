@@ -1,18 +1,19 @@
 //! The download orchestrator.
 //!
 //! Per depot: parse manifest → ids/key → plan every file → run chunk downloads under a shared
-//! concurrency semaphore → commit state. Files are planned/executed concurrently; network
-//! concurrency is bounded by [`DownloadRequest::max_downloads`].
+//! concurrency semaphore → commit state. Files are planned/executed concurrently (at most a
+//! bounded number in flight); network concurrency is bounded by
+//! [`DownloadRequest::max_downloads`].
 //!
 //! Where the work of a run actually goes, in the order that matters for a fast download:
 //!
 //! | stage                   | cost                        | treatment |
 //! |-------------------------|-----------------------------|-----------|
-//! | chunk fetch             | network-bound               | `max_downloads`-wide semaphore |
+//! | chunk fetch             | network-bound               | `max_downloads`-wide semaphore; repeated chunks of a file fetched once |
 //! | decrypt + decompress    | CPU, per chunk              | thread-local scratch buffers + a retained zstd `DCtx` |
 //! | chunk verify/write      | small                       | positional I/O through `Arc<File>` - no mutex |
-//! | file plan (verify run)  | disk + CPU                  | one `spawn_blocking` per file, one stat per file |
-//! | chunk reuse copy        | disk, can be many GB        | coalesced runs, a pool of blocking tasks |
+//! | file plan (verify run)  | disk + CPU                  | one `spawn_blocking` per file, one stat per file, offset-ordered reads |
+//! | chunk reuse copy        | disk, can be many GB        | skipped when offsets are unchanged; else coalesced runs, a pool of blocking tasks |
 //!
 //! Reuse semantics (exactly what the crate docs promise):
 //!
@@ -21,7 +22,8 @@
 //! | file missing                                    | download every chunk                          |
 //! | same manifest gid as installed                  | verify every chunk (Steam-style verify)       |
 //! | new gid, file hash unchanged across versions    | skip without reading                          |
-//! | new gid, file hash changed                      | verify on-disk chunks; reuse valid ones via staging |
+//! | new gid, file hash changed, reused chunks kept their offsets | verify on-disk chunks; patch only the changed ones in place |
+//! | new gid, file hash changed, reused chunks moved | verify on-disk chunks; rebuild via staging    |
 //! | prior install with no/unknown state             | verify against the new manifest in place      |
 //!
 //! Files on disk that are not listed in the manifest are never touched and never deleted.
@@ -53,6 +55,16 @@ const COPY_STRIDE: u64 = 4 * 1024 * 1024;
 /// bottleneck there, not the CDN, so this is independent of `max_downloads` and small: an
 /// update that reuses most of the old install moves real gigabytes through it.
 const COPY_PARALLELISM: usize = 4;
+
+/// How many files may be in flight (planning, holding an open handle, waiting on chunks) at
+/// once, as a multiple of `max_downloads`, clamped to [`FILE_PARALLELISM_MIN`,
+/// `FILE_PARALLELISM_MAX`]. Without a bound every file of the depot would plan concurrently
+/// (a `spawn_blocking` storm on a 50k-file depot) and open its write handle while still
+/// queued for a download permit - enough to hit the default 1024-descriptor limit and fail
+/// the depot with EMFILE. The floor keeps enough small files queued to saturate the network.
+const FILE_PARALLELISM_FACTOR: usize = 4;
+const FILE_PARALLELISM_MIN: usize = 32;
+const FILE_PARALLELISM_MAX: usize = 256;
 
 pub(crate) struct DownloadEngine {
     http: reqwest::Client,
@@ -99,6 +111,8 @@ struct DepotCtx<'a> {
     downloads_sem: Arc<Semaphore>,
     /// Caps concurrent chunk-reuse copies (see [`COPY_PARALLELISM`]).
     copies_sem: Arc<Semaphore>,
+    /// Caps files in flight (see [`FILE_PARALLELISM_FACTOR`]).
+    files_sem: Semaphore,
 }
 
 /// How a file's bytes are sourced.
@@ -168,6 +182,32 @@ fn coalesce_copy_runs(ops: &[CopyOp]) -> Vec<CopyRun> {
     runs
 }
 
+/// Group a file's download set by chunk id: each distinct chunk is fetched once, and every
+/// further offset holding the same content rides along as an extra write target. Real
+/// manifests repeat chunks inside a file (zero padding, repeated blocks) - 17 files of the
+/// Aion 2 fixture do. Keeps the (offset-ascending) order of each id's first occurrence.
+fn dedup_downloads(downloads: Vec<ManifestChunk>) -> Vec<(ManifestChunk, Vec<u64>)> {
+    let mut first_by_id: HashMap<[u8; 20], usize> = HashMap::with_capacity(downloads.len());
+    let mut grouped: Vec<(ManifestChunk, Vec<u64>)> = Vec::with_capacity(downloads.len());
+    for chunk in downloads {
+        match first_by_id.get(&chunk.id) {
+            // Identical id but a different declared shape would be a corrupt manifest; never
+            // guess - fetch it separately and let its own verification decide.
+            Some(&index)
+                if grouped[index].0.len_uncompressed == chunk.len_uncompressed
+                    && grouped[index].0.adler32 == chunk.adler32 =>
+            {
+                grouped[index].1.push(chunk.offset);
+            }
+            _ => {
+                first_by_id.entry(chunk.id).or_insert(grouped.len());
+                grouped.push((chunk, Vec::new()));
+            }
+        }
+    }
+    grouped
+}
+
 /// Everything one chunk download needs; handed to [`DownloadEngine::download_chunk`].
 struct ChunkJob {
     /// Shared, never mutable: positional writes need no lock, so one open handle serves every
@@ -177,6 +217,9 @@ struct ChunkJob {
     display_path: PathBuf,
     file_size: u64,
     chunk: ManifestChunk,
+    /// Further offsets in the same file that hold this exact chunk (same id). The chunk is
+    /// fetched and decompressed once and written to `chunk.offset` plus each of these.
+    extra_offsets: Vec<u64>,
     /// Held for the lifetime of the future; caps global network concurrency.
     _permit: OwnedSemaphorePermit,
 }
@@ -426,6 +469,12 @@ impl DownloadEngine {
                 depot_bytes_total: bytes_total,
                 downloads_sem: Arc::new(Semaphore::new(self.request.max_downloads)),
                 copies_sem: Arc::new(Semaphore::new(copy_parallelism)),
+                files_sem: Semaphore::new(
+                    self.request
+                        .max_downloads
+                        .saturating_mul(FILE_PARALLELISM_FACTOR)
+                        .clamp(FILE_PARALLELISM_MIN, FILE_PARALLELISM_MAX),
+                ),
             };
 
             // Each file is consumed by exactly one task, so its chunk list can be *moved*
@@ -472,6 +521,18 @@ impl DownloadEngine {
 
     /// Plan + execute one content file of a depot.
     async fn execute_file(&self, ctx: &DepotCtx<'_>, mut file: ManifestFile) -> Result<()> {
+        // Bounded file concurrency: planning, the open write handle and the chunk queue all
+        // live under this permit. Files queued behind it that see a cancellation (another
+        // file failed) leave without planning or touching the disk.
+        let _file_permit = ctx
+            .files_sem
+            .acquire()
+            .await
+            .map_err(|e| Error::TaskFailed(e.to_string()))?;
+        if ctx.depot_cancel.is_cancelled() || self.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
         let rel = util::safe_relative_path(&file.path).ok_or_else(|| {
             Error::Manifest(format!(
                 "unsafe or empty file path '{}' in manifest",
@@ -625,30 +686,43 @@ impl DownloadEngine {
             }
         }
 
-        // Download the remaining chunks.
-        let mut jobs = FuturesUnordered::new();
-        for chunk in plan.downloads {
-            if ctx.depot_cancel.is_cancelled() || self.cancel.is_cancelled() {
-                return Err(Error::Cancelled);
+        // Download the remaining chunks. Each future takes its network permit *itself*, when
+        // it is first polled: acquiring permits up front and parking them inside futures that
+        // nobody polls yet deadlocks as soon as a file has more chunks than `max_downloads`.
+        // `buffer_unordered` polls up to `max_downloads` of this file's chunks at a time (more
+        // would only queue on the semaphore) and starts the next one as each finishes.
+        {
+            let mut jobs = futures::stream::iter(dedup_downloads(plan.downloads))
+                .map(|(chunk, extra_offsets)| {
+                    let sem = Arc::clone(&ctx.downloads_sem);
+                    let file_handle = Arc::clone(&file_handle);
+                    let done_bytes = Arc::clone(&done_bytes);
+                    let display_path = display_path.clone();
+                    let file_size = file.size;
+                    async move {
+                        let permit = sem
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| Error::TaskFailed(e.to_string()))?;
+                        self.download_chunk(
+                            ctx,
+                            ChunkJob {
+                                file_handle,
+                                done_bytes,
+                                display_path,
+                                file_size,
+                                chunk,
+                                extra_offsets,
+                                _permit: permit,
+                            },
+                        )
+                        .await
+                    }
+                })
+                .buffer_unordered(self.request.max_downloads);
+            while let Some(result) = jobs.next().await {
+                result?;
             }
-            let permit = Arc::clone(&ctx.downloads_sem)
-                .acquire_owned()
-                .await
-                .map_err(|e| Error::TaskFailed(e.to_string()))?;
-            jobs.push(self.download_chunk(
-                ctx,
-                ChunkJob {
-                    file_handle: Arc::clone(&file_handle),
-                    done_bytes: Arc::clone(&done_bytes),
-                    display_path: display_path.clone(),
-                    file_size: file.size,
-                    chunk,
-                    _permit: permit,
-                },
-            ));
-        }
-        while let Some(result) = jobs.next().await {
-            result?;
         }
 
         if plan.staging {
@@ -726,6 +800,7 @@ impl DownloadEngine {
             display_path,
             file_size,
             chunk,
+            extra_offsets,
             _permit,
         } = job;
 
@@ -734,54 +809,70 @@ impl DownloadEngine {
         }
 
         let chunk_hex = util::to_hex_lower(&chunk.id);
-        let fetch = ctx.client.fetch_chunk(
-            ctx.depot_id,
-            &chunk_hex,
-            chunk.len_compressed,
-            &ctx.depot_cancel,
-        );
-        // Cancellation must also cut short an in-flight request, not just the gaps between
-        // attempts - a hanging CDN must never delay a `cancel()` by the request timeout.
-        let raw = tokio::select! {
-            biased;
-            _ = ctx.depot_cancel.cancelled() => return Err(Error::Cancelled),
-            _ = self.cancel.cancelled() => return Err(Error::Cancelled),
-            result = fetch => result?,
-        };
-        let network_len = raw.len() as u64;
 
-        // Decrypt + verify + write at the chunk's offset (blocking). The body is moved into
-        // the blocking task and handed to the chunk pipeline as a slice: no second copy of
-        // the chunk, and the pipeline reuses this thread's scratch buffers.
+        // Decrypt + verify + write at the chunk's offset(s) (blocking), run by the CDN client
+        // for each copy it fetches until one is good - a corrupt response from one server is
+        // retried on the next instead of failing the depot. The body is moved into the
+        // blocking task and handed to the chunk pipeline as a slice: no second copy of the
+        // chunk, and the pipeline reuses this thread's scratch buffers.
         let key = ctx.key;
-        let offset = chunk.offset;
-        let handle = Arc::clone(&file_handle);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            chunk::process_chunk_at(
-                &raw,
-                &key,
-                chunk.len_uncompressed,
-                chunk.adler32,
+        let len_uncompressed = chunk.len_uncompressed;
+        let adler32 = chunk.adler32;
+        let offsets: Arc<[u64]> = std::iter::once(chunk.offset).chain(extra_offsets).collect();
+        let copies = offsets.len() as u64;
+        let process = |raw: bytes::Bytes| {
+            let handle = Arc::clone(&file_handle);
+            let offsets = Arc::clone(&offsets);
+            let chunk_hex = chunk_hex.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    chunk::process_chunk_at(
+                        &raw,
+                        &key,
+                        len_uncompressed,
+                        adler32,
+                        &chunk_hex,
+                        &handle,
+                        &offsets,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(chunk::ChunkFailure {
+                        kind: chunk::ChunkFailureKind::Local,
+                        error: Error::TaskFailed(e.to_string()),
+                    })
+                })
+            }
+        };
+        // `depot_cancel` is a child of the run's token, so it also fires on `cancel()`; the
+        // client watches it during every request - a hanging CDN must never delay a
+        // cancellation by the request timeout.
+        let network_len = ctx
+            .client
+            .fetch_chunk(
+                ctx.depot_id,
                 &chunk_hex,
-                &handle,
-                offset,
+                chunk.len_compressed,
+                &ctx.depot_cancel,
+                process,
             )
-        })
-        .await
-        .map_err(|e| Error::TaskFailed(e.to_string()))??;
+            .await?;
 
+        // Every placement of a deduplicated chunk is real file content, so it counts once per
+        // offset towards the uncompressed totals; the network body only once.
+        let written = u64::from(chunk.len_uncompressed) * copies;
         let downloaded = self
             .total_downloaded
             .fetch_add(network_len, Ordering::Relaxed)
             + network_len;
         let uncompressed = self
             .total_uncompressed
-            .fetch_add(u64::from(chunk.len_uncompressed), Ordering::Relaxed)
-            + u64::from(chunk.len_uncompressed);
+            .fetch_add(written, Ordering::Relaxed)
+            + written;
         ctx.depot_downloaded
             .fetch_add(network_len, Ordering::Relaxed);
-        let file_done = done_bytes.fetch_add(u64::from(chunk.len_uncompressed), Ordering::Relaxed)
-            + u64::from(chunk.len_uncompressed);
+        let file_done = done_bytes.fetch_add(written, Ordering::Relaxed) + written;
 
         self.emit_best_effort(ProgressEvent::ChunkCompleted {
             depot_id: ctx.depot_id,
@@ -789,7 +880,7 @@ impl DownloadEngine {
             file_bytes_completed: file_done,
             file_size,
             downloaded_increment: network_len,
-            uncompressed_increment: u64::from(chunk.len_uncompressed),
+            uncompressed_increment: written,
             total_downloaded: downloaded,
             total_uncompressed: uncompressed,
         });
@@ -876,8 +967,9 @@ fn plan_file(input: PlanInput) -> Result<FilePlan> {
     }
 
     // Chunk-id reuse: when we know what the previous version looked like, reuse every on-disk
-    // chunk whose (id, adler) matches a chunk of the new manifest. Reused chunks are copied
-    // into a staging file (offsets may have moved), the rest is downloaded.
+    // chunk whose (id, adler) matches a chunk of the new manifest. Chunks that moved are
+    // copied into a staging file; if none moved, the file is patched in place. The rest is
+    // downloaded.
     if !verify_all {
         if let Some(old_chunks) = &old_chunks {
             if !old_chunks.is_empty() {
@@ -976,6 +1068,24 @@ fn plan_reuse_from_old(
         .iter()
         .map(|op| u64::from(op.chunk.len_uncompressed))
         .sum();
+
+    // Every reused chunk already sits at its new offset (an update that only changed some
+    // chunks in place, or appended/truncated): there is nothing to move, so patch the file in
+    // place - exactly like a verify run - instead of rebuilding the whole file through
+    // staging. For a large file with a small change this turns "read + write the entire file
+    // again" into "write only the changed chunks".
+    if copies.iter().all(|op| op.source_offset == op.chunk.offset) {
+        return Ok(FilePlan {
+            downloads,
+            reused_bytes: copy_bytes,
+            copy_bytes: 0,
+            ..FilePlan::default()
+        });
+    }
+
+    // Staging path: copies arrive in old-manifest order; destination order is what
+    // `coalesce_copy_runs` merges on (and what keeps the staging writes sequential).
+    copies.sort_unstable_by_key(|op| (op.chunk.offset, op.source_offset));
 
     Ok(FilePlan {
         downloads,
@@ -1211,6 +1321,283 @@ mod tests {
 
     // ── tests ────────────────────────────────────────────────────────────────
 
+    /// Download through an explicit, ordered server list.
+    async fn run_download_servers(
+        out: &Path,
+        manifest: Vec<u8>,
+        key_hex: &str,
+        servers: &[&MockServer],
+    ) -> DownloadReport {
+        let downloader = crate::DepotDownloader::builder()
+            .cdn_servers(
+                servers
+                    .iter()
+                    .map(|s| CdnServer::http(&s.address().to_string()).expect("address"))
+                    .collect::<Vec<_>>(),
+            )
+            .build()
+            .expect("downloader");
+        let request = DownloadRequest::builder()
+            .app_id(APP_ID)
+            .depots([(manifest, key_hex)])
+            .output_dir(out)
+            .build()
+            .expect("request");
+        let mut handle = downloader.download(request);
+        while let Some(event) = handle.events().recv().await {
+            if matches!(event, ProgressEvent::Finished { .. }) {
+                break;
+            }
+        }
+        handle.join().await.expect("join")
+    }
+
+    /// A server that returns a corrupt chunk (right length, bad content) no longer fails the
+    /// depot: the chunk is retried on the next server.
+    #[tokio::test]
+    async fn corrupt_chunk_is_retried_on_next_server() {
+        let content: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 173) as u8).collect();
+        let manifest = build_manifest(DEPOT_ID, 3400, &[("one.bin", content.clone(), 0)]);
+        let served = chunks_with_offsets(&content);
+        let (chunk, good_body) = served[0].clone();
+
+        // Same length, one flipped byte mid-ciphertext: decrypts (padding intact) to garbage.
+        let mut bad_body = good_body.clone();
+        let mid = bad_body.len() / 2;
+        bad_body[mid] ^= 0xFF;
+
+        let bad = MockServer::start().await;
+        mount_chunks(&bad, DEPOT_ID, &[(chunk.clone(), bad_body)]).await;
+        let good = MockServer::start().await;
+        mount_chunks(&good, DEPOT_ID, &[(chunk, good_body)]).await;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        // One chunk → the round-robin cursor starts at the first (bad) server.
+        let report =
+            run_download_servers(out.path(), manifest, &test_key_hex(), &[&bad, &good]).await;
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        assert_eq!(
+            bad.received_requests().await.expect("recording").len(),
+            1,
+            "the bad server was tried first"
+        );
+        assert_eq!(
+            std::fs::read(out.path().join("one.bin")).expect("one.bin"),
+            content
+        );
+    }
+
+    /// A wrong depot key is not "rotated away" across every server: one extra server is
+    /// tried (a corrupted last block looks identical), then the depot fails.
+    #[tokio::test]
+    async fn wrong_key_stops_after_two_servers() {
+        let content: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 151) as u8).collect();
+        let manifest = build_manifest(DEPOT_ID, 3500, &[("one.bin", content.clone(), 0)]);
+        let served = chunks_with_offsets(&content);
+
+        let mut servers = Vec::new();
+        for _ in 0..4 {
+            let server = MockServer::start().await;
+            mount_chunks(&server, DEPOT_ID, &served).await;
+            servers.push(server);
+        }
+        let refs: Vec<&MockServer> = servers.iter().collect();
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let report = run_download_servers(out.path(), manifest, &"ab".repeat(32), &refs).await;
+        assert!(!report.is_ok(), "a wrong key must fail the depot");
+
+        let mut requests = 0;
+        for server in &servers {
+            requests += server.received_requests().await.expect("recording").len();
+        }
+        assert_eq!(
+            requests, 2,
+            "wrong key: exactly one retry, not a full rotation"
+        );
+    }
+
+    /// Regression: a file with more chunks than `max_downloads` used to deadlock - permits
+    /// were taken up front and parked inside futures that were not polled until every chunk
+    /// had a permit.
+    #[tokio::test]
+    async fn file_with_more_chunks_than_max_downloads_completes() {
+        let server = MockServer::start().await;
+        let content: Vec<u8> = (0..20 * CHUNK_SIZE + 77).map(|i| (i % 241) as u8).collect();
+        let v1 = build_manifest(DEPOT_ID, 3000, &[("big.bin", content.clone(), 0)]);
+        mount_chunks(&server, DEPOT_ID, &chunks_with_offsets(&content)).await;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let key = test_key_hex();
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_download(out.path(), v1, &key, server.address().to_string()),
+        )
+        .await
+        .expect("download must not deadlock");
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        assert_eq!(
+            std::fs::read(out.path().join("big.bin")).expect("big.bin"),
+            content
+        );
+    }
+
+    /// Many files at once stay under the bounded file concurrency and all complete.
+    #[tokio::test]
+    async fn many_files_complete_under_bounded_file_concurrency() {
+        let server = MockServer::start().await;
+        let files: Vec<(String, Vec<u8>)> = (0..FILE_PARALLELISM_MAX + 50)
+            .map(|n| {
+                let content: Vec<u8> = (0..1024 + n).map(|i| ((i * 7 + n) % 253) as u8).collect();
+                (format!("data/file_{n}.bin"), content)
+            })
+            .collect();
+        let entries: Vec<(&str, Vec<u8>, u32)> = files
+            .iter()
+            .map(|(name, content)| (name.as_str(), content.clone(), 0))
+            .collect();
+        let manifest = build_manifest(DEPOT_ID, 3100, &entries);
+        for (_, content) in &files {
+            mount_chunks(&server, DEPOT_ID, &chunks_with_offsets(content)).await;
+        }
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let key = test_key_hex();
+        let report = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_download(out.path(), manifest, &key, server.address().to_string()),
+        )
+        .await
+        .expect("download must finish");
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        for (name, content) in &files {
+            assert_eq!(
+                &std::fs::read(out.path().join(name)).expect("file"),
+                content
+            );
+        }
+    }
+
+    /// A chunk repeated inside one file is fetched from the CDN exactly once and written to
+    /// every offset that holds it.
+    #[tokio::test]
+    async fn repeated_chunk_in_file_is_fetched_once() {
+        let server = MockServer::start().await;
+        let block: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 97) as u8).collect();
+        let other: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 89) as u8).collect();
+        let mut content = block.clone();
+        content.extend_from_slice(&other);
+        content.extend_from_slice(&block);
+        content.extend_from_slice(&block);
+        let v1 = build_manifest(DEPOT_ID, 3200, &[("dup.bin", content.clone(), 0)]);
+
+        let (block_chunk, block_body) = served_chunk(&block);
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/depot/{DEPOT_ID}/chunk/{}",
+                util::to_hex_lower(block_chunk.sha.as_ref().expect("sha"))
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(block_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (other_chunk, other_body) = served_chunk(&other);
+        mount_chunks(&server, DEPOT_ID, &[(other_chunk, other_body)]).await;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let report = run_download(
+            out.path(),
+            v1,
+            &test_key_hex(),
+            server.address().to_string(),
+        )
+        .await;
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        assert_eq!(report.uncompressed_bytes, content.len() as u64);
+        assert_eq!(
+            std::fs::read(out.path().join("dup.bin")).expect("dup.bin"),
+            content
+        );
+        server.verify().await;
+    }
+
+    /// An update whose reused chunks all keep their offsets is patched in place: no staging
+    /// rebuild (same inode), only the changed chunk crosses the network.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offset_preserving_update_patches_in_place() {
+        use std::os::unix::fs::MetadataExt;
+
+        let server1 = MockServer::start().await;
+        let v1_content: Vec<u8> = (0..4 * CHUNK_SIZE).map(|i| (i % 211) as u8).collect();
+        let v1 = build_manifest(DEPOT_ID, 3300, &[("pak.bin", v1_content.clone(), 0)]);
+        mount_chunks(&server1, DEPOT_ID, &chunks_with_offsets(&v1_content)).await;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let report = run_download(
+            out.path(),
+            v1,
+            &test_key_hex(),
+            server1.address().to_string(),
+        )
+        .await;
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        let inode_before = std::fs::metadata(out.path().join("pak.bin"))
+            .expect("pak.bin")
+            .ino();
+
+        // v2: third chunk changed in place, plus a shorter tail (truncation).
+        let mut v2_content = v1_content.clone();
+        for byte in &mut v2_content[2 * CHUNK_SIZE..3 * CHUNK_SIZE] {
+            *byte = byte.wrapping_add(1);
+        }
+        v2_content.truncate(3 * CHUNK_SIZE + 1000);
+        let v2 = build_manifest(DEPOT_ID, 3301, &[("pak.bin", v2_content.clone(), 0)]);
+
+        let server2 = MockServer::start().await;
+        let v2_chunks = chunks_with_offsets(&v2_content);
+        // Only the changed chunk and the new short tail are served; anything else 404s.
+        mount_chunks(&server2, DEPOT_ID, &v2_chunks[2..]).await;
+        let report = run_download(
+            out.path(),
+            v2,
+            &test_key_hex(),
+            server2.address().to_string(),
+        )
+        .await;
+        assert!(report.is_ok(), "depots: {:?}", report.depots);
+        let tail_and_changed: u64 = v2_chunks[2..].iter().map(|(_, b)| b.len() as u64).sum();
+        assert_eq!(report.downloaded_bytes, tail_and_changed);
+        assert_eq!(
+            std::fs::read(out.path().join("pak.bin")).expect("pak.bin"),
+            v2_content
+        );
+        assert_eq!(
+            std::fs::metadata(out.path().join("pak.bin"))
+                .expect("pak.bin")
+                .ino(),
+            inode_before,
+            "an offset-preserving update must patch in place, not rebuild via staging"
+        );
+    }
+
+    #[test]
+    fn dedup_groups_identical_chunks_and_keeps_order() {
+        let chunk = |id: u8, offset: u64| ManifestChunk {
+            id: [id; 20],
+            adler32: u32::from(id),
+            offset,
+            len_uncompressed: 10,
+            len_compressed: 12,
+        };
+        let grouped = dedup_downloads(vec![chunk(1, 0), chunk(2, 10), chunk(1, 20), chunk(1, 30)]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0.offset, 0);
+        assert_eq!(grouped[0].1, vec![20, 30]);
+        assert_eq!(grouped[1].0.offset, 10);
+        assert!(grouped[1].1.is_empty());
+    }
+
     #[tokio::test]
     async fn fresh_download_then_verify_rerun_downloads_nothing() {
         let server = MockServer::start().await;
@@ -1363,18 +1750,19 @@ mod tests {
         .await;
         assert!(report.is_ok(), "depots: {:?}", report.depots);
 
-        // v2: same first chunk (reusable), a new second chunk.
-        let mut v2_content = v1_content.clone();
-        v2_content.extend((0..CHUNK_SIZE).map(|i| (i % 41) as u8));
+        // v2: a new chunk inserted at the front, so both v1 chunks are reusable but *moved* -
+        // that forces the staging rebuild (an append would be patched in place).
+        let mut v2_content: Vec<u8> = (0..CHUNK_SIZE).map(|i| (i % 41) as u8).collect();
+        v2_content.extend_from_slice(&v1_content);
         let v2 = build_manifest(DEPOT_ID, 2101, &[("bin/game.exe", v2_content.clone(), 32)]);
 
         let server2 = MockServer::start().await;
         let new_chunks = chunks_with_offsets(&v2_content);
-        let (_, new_body) = new_chunks.last().expect("new chunk").clone();
+        let (_, new_body) = new_chunks.first().expect("new chunk").clone();
         mount_chunks(
             &server2,
             DEPOT_ID,
-            &[(new_chunks.last().expect("c").0.clone(), new_body)],
+            &[(new_chunks.first().expect("c").0.clone(), new_body)],
         )
         .await;
 
@@ -1434,7 +1822,7 @@ mod tests {
             }
         }
         assert_eq!(chunk_events, 1, "only the new chunk is downloaded");
-        // 128 KiB seen in place (the reusable first chunk) + 128 KiB just downloaded.
+        // 256 KiB copied through staging + 128 KiB just downloaded.
         assert_eq!(max_completed, v2_content.len() as u64);
         assert_eq!(
             std::fs::read(out.path().join("bin/game.exe")).expect("game.exe"),

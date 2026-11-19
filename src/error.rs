@@ -83,12 +83,13 @@ impl Error {
 
     /// Should the CDN client try the next server after this error?
     ///
-    /// Mirrors DepotDownloader's retry taxonomy: timeouts/connection failures/5xx rotate to the
-    /// next server, while 401/403/404 are fatal for the depot (this crate cannot mint CDN auth
-    /// tokens - supply a manifest file key material that works).
+    /// Mirrors DepotDownloader's retry taxonomy: timeouts/connection failures (including a
+    /// connection dropped mid-request or mid-body)/5xx rotate to the next server, while
+    /// 401/403/404 are fatal for the depot (this crate cannot mint CDN auth tokens - supply a
+    /// manifest file key material that works).
     pub(crate) fn rotates_cdn_server(&self) -> bool {
         match self {
-            Error::Http(e) => e.is_timeout() || e.is_connect(),
+            Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
             Error::HttpStatus { status, .. } => {
                 matches!(status, 408 | 425 | 429 | 500..=599)
             }
